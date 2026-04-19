@@ -1,0 +1,9 @@
+# File data besar
+*.csv
+*.excel
+*.nc
+*.h5
+*.tif
+*.tiff
+data/
+output/
