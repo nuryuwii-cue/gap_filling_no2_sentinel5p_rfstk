@@ -1,0 +1,806 @@
+---
+title: "Analisis GTWR - Prevalensi ISPA dan Konsentrasi NO2"
+output:
+  html_document:
+    self_contained: false
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+---
+
+# Instalasi dan Load Library
+```{r setup}
+# Data Preparation Package
+library(dplyr)
+library(readxl)
+library(knitr)
+library(openxlsx)
+
+# GTWR and Model Geospatial Package
+library(GWmodel)
+library(sp)
+
+# Asumption Test Package
+library(lmtest)
+library(car)
+library(spdep)
+
+# Plot Package
+library(ggplot2)
+library(ggspatial)
+library(RColorBrewer)
+library(gridExtra)
+library(sf)
+library(patchwork)
+
+# Font Settings
+theme_times <- theme_classic() +
+  theme(
+    text = element_text(family = "serif"),
+    axis.title = element_text(family = "serif"),
+    axis.text  = element_text(family = "serif")
+  )
+```
+
+---
+
+# Load Data
+```{r load-data}
+# Tampilkan struktur data
+variable <- read_excel("C:/Users/zaviezra/Documents/UNDIP/TA/02skripsi/02processing/Data/XSL_CSV/01-gtwr_var.xlsx")
+glimpse(variable)
+head(variable)
+
+#CEK NAN
+variable <- variable %>% filter(!is.na(week) & !is.na(pop_dens) & 
+                        !is.na(ari_prevalence) & !is.na(x) & !is.na(y) & !is.na(no2)
+                        & !is.na(tp) & !is.na(h) & !is.na(temp))
+```
+
+```{r}
+variabel_stat <- list(
+  list(kolom = "ari_prevalence", label = "Prevalensi ISPA"),
+  list(kolom = "no2",            label = "Konsentrasi NO2 (mol/m²)"),
+  list(kolom = "tp",             label = "Curah Hujan (mm)"),
+  list(kolom = "h",              label = "Kelembapan (%)"),
+  list(kolom = "temp",           label = "Suhu Udara (°C)"),
+  list(kolom = "pop_dens",       label = "Kepadatan Penduduk (ribu/km²)")
+)
+
+tabel_desk <- purrr::map_dfr(variabel_stat, function(v) {
+  x   <- na.omit(variable[[v$kolom]])
+  dec <- ifelse(v$kolom == "no2", 6, 3)
+  fmt <- function(val) formatC(val, digits = dec, format = "f")
+  data.frame(
+    Variabel   = v$label,
+    N          = length(x),          # ← kolom N ditambahkan
+    Min        = fmt(min(x)),
+    Max        = fmt(max(x)),
+    Mean       = fmt(mean(x)),
+    Median     = fmt(median(x)),
+    `Std. Dev` = fmt(sd(x)),
+    check.names = FALSE
+  )
+})
+
+# Tampilkan sebagai tabel teks biasa
+print(tabel_desk, row.names = FALSE)
+```
+
+
+# Histogram Grid 2x3 untuk Setiap variable
+```{r histogram-grid, fig.width=15, fig.height=10}
+variabel_plot <- list(
+  list(kolom = "ari_prevalence", label = "Prevalensi ISPA"),
+  list(kolom = "no2",            label = "Konsentrasi NO2 (mol/m²)"),
+  list(kolom = "tp",             label = "Curah Hujan (mm)"),
+  list(kolom = "h",              label = "Kelembapan (%)"),
+  list(kolom = "temp",           label = "Suhu Udara (°C)"),
+  list(kolom = "pop_dens",       label = "Kepadatan Penduduk (ribu/km²)")
+)
+
+huruf_panel <- c("a", "b", "c", "d", "e", "f")
+
+buat_histogram <- function(df, kolom, label_x, huruf) {
+  data_var <- na.omit(df[[kolom]])
+  n_val    <- length(data_var)                        # ← hitung N
+  n_label  <- paste0("N = ", format(n_val, big.mark = ".", decimal.mark = ","))
+  df_plot  <- data.frame(x = data_var)
+
+  p <- ggplot(df_plot, aes(x = x)) +
+    geom_histogram(bins = 25, fill = "#9b908a", color = "black", alpha = 0.9) +
+    labs(x = label_x, y = "Frekuensi") +
+    # Huruf panel — pojok kiri atas
+    annotate("text", x = -Inf, y = Inf, label = huruf,
+             hjust = -0.8, vjust = 1.5, size = 6, family = "serif") +
+    # Label N — pojok kanan atas                      # ← BARU
+    annotate("text", x = Inf, y = Inf, label = n_label,
+             hjust = 1.15, vjust = 1.8, size = 8, family = "serif",
+             color = "black") +
+    theme_times +
+    theme(
+      axis.title = element_text(size = 17),
+      axis.text  = element_text(size = 15)
+    )
+
+  y_range <- layer_scales(p)$y$range$range
+  if (!is.null(y_range)) {
+    p <- p + ylim(0, y_range[2] * 1.2)
+  }
+
+  return(p)
+}
+
+plot_list <- mapply(
+  FUN      = function(v, h) buat_histogram(variable, v$kolom, v$label, h),
+  v        = variabel_plot,
+  h        = huruf_panel,
+  SIMPLIFY = FALSE
+)
+
+gridExtra::grid.arrange(grobs = plot_list, nrow = 2, ncol = 3)
+```
+
+
+# Grafik Dual-Axis Fluktuasi Mingguan ISPA dan NO2
+```{r dual-axis-weekly, fig.width=10, fig.height=6}
+# 1. Agregasi rata-rata mingguan DAN SIMPAN ke objek baru (weekly_avg)
+weekly_avg <- variable %>%
+  group_by(week) %>%
+  summarise(
+    ari_prevalence = mean(ari_prevalence, na.rm = TRUE),
+    no2            = mean(no2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2. Normalisasi NO2 ke skala ISPA
+# Hitung rentang dari data yang sudah diagregasi
+ispa_range <- range(weekly_avg$ari_prevalence)
+no2_range  <- range(weekly_avg$no2)
+
+scale_factor <- diff(ispa_range) / diff(no2_range)
+shift_factor <- ispa_range[1] - no2_range[1] * scale_factor
+
+# BUAT DAN SIMPAN kolom no2_scaled kembali ke dalam weekly_avg
+weekly_avg <- weekly_avg %>%
+  mutate(no2_scaled = no2 * scale_factor + shift_factor)
+
+# 3. Buat grafik dual-axis menggunakan data weekly_avg
+p_dual <- ggplot(weekly_avg, aes(x = week)) +
+  geom_line(aes(y = ari_prevalence, color = "Prevalensi ISPA"), linewidth = 1.5) +
+  geom_point(aes(y = ari_prevalence, color = "Prevalensi ISPA"), shape = 16, size = 2) +
+  geom_line(aes(y = no2_scaled, color = "Konsentrasi NO2"), linewidth = 1.5, linetype = "dashed") +
+  geom_point(aes(y = no2_scaled, color = "Konsentrasi NO2"), shape = 15, size = 2) +
+  
+  # Modifikasi Sumbu X menjadi kelipatan 5
+  scale_x_continuous(breaks = seq(0, 30, by = 5)) +
+  
+  scale_y_continuous(
+    name = "Prevalensi ISPA",
+    sec.axis = sec_axis(
+      ~ (. - shift_factor) / scale_factor,
+      name = "Konsentrasi NO2 (mol/m²)"
+    )
+  ) +
+  scale_color_manual(values = c("Prevalensi ISPA" = "red", "Konsentrasi NO2" = "steelblue")) +
+  labs(
+    title = "Fluktuasi Rata-Rata NO2 dan Prevalensi ISPA",
+    x     = "Minggu ke-",
+    color = NULL
+  ) +
+  theme_times +
+theme(
+    # Mengatur ukuran judul utama grafik
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    # Mengatur ukuran judul sumbu X ("Minggu ke-")
+    axis.title.x = element_text(size = 14),
+    # Mengatur ukuran judul sumbu Y kiri ("Prevalensi ISPA")
+    axis.title.y.left  = element_text(color = "red", size = 14),
+    # Mengatur ukuran judul sumbu Y kanan ("Konsentrasi NO2...")
+    axis.title.y.right = element_text(color = "steelblue", size = 14),
+    # Mengatur ukuran teks angka pada sumbu X dan Y (0, 5, 10, dst)
+    axis.text = element_text(size = 12),
+    # Mengatur ukuran teks keterangan pada legenda bawah
+    legend.text = element_text(size = 12),
+    legend.position = "bottom",
+    panel.grid.major = element_line(linetype = "dotted", color = "gray70")
+  )
+
+# Tampilkan plot
+print(p_dual)
+```
+
+---
+# Variable Definition
+```{r variable}
+# Dependent and Indepedent Variable
+y <- "ari_prevalence"
+X <- c("no2", "tp", "h", "temp", "pop_dens")
+
+# Coordinate
+coords <- variable[, c("x", "y")]
+
+sp_data <- sp::SpatialPointsDataFrame(
+  coords      = coords,
+  data        = variable,
+  proj4string = sp::CRS("+proj=utm +zone=49 +datum=WGS84")
+)
+
+cat("Jumlah observasi:", nrow(sp_data), "\n")
+```
+
+
+# Ordinary Least Square (OLS)
+```{r descriptive-stats}
+# Formula OLS
+formula_ols <- as.formula(paste(y, "~", paste(X, collapse = " + ")))
+
+cat("\n=== MODEL REGRESI GLOBAL (OLS) ===\n")
+ols_model   <- lm(formula_ols, data = variable)
+
+# UBAH NAMA OBJEK MENJADI ols_summary
+ols_summary <- summary(ols_model) 
+print(ols_summary)
+      
+# A. Pembuatan Tabel Koefisien Variabel
+coef_df <- as.data.frame(ols_summary$coefficients)
+colnames(coef_df) <- c("Koefisien", "Std_Error", "t_value", "p_value")
+coef_df$Signifikansi <- ifelse(coef_df$p_value < 0.05, "Signifikan", "Tidak Signifikan")
+
+# Membulatkan angka agar rapi
+coef_df[, 1:4] <- round(coef_df[, 1:4], 4)
+
+cat("\n--- Tabel Koefisien Variabel OLS ---\n")
+print(coef_df)
+
+# B. Pembuatan Tabel Evaluasi Metrik
+metrics_df <- data.frame(
+  Metrik = c("R-squared", "Adjusted R-squared", "F-statistic", "Residual Std. Error"),
+  Nilai  = round(c(ols_summary$r.squared, ols_summary$adj.r.squared, ols_summary$fstatistic[1], ols_summary$sigma), 4)
+)
+
+cat("\n--- Tabel Metrik Evaluasi OLS ---\n")
+print(metrics_df, row.names = FALSE)
+```
+
+
+# Uji Asumsi Residual OLS
+```{r ols-assumption-tests}
+resid_ols <- residuals(ols_model)
+
+# Eksekusi 4 Uji Asumsi
+# 1. Normalitas
+resid_ols_scale <- scale(resid_ols)[, 1]
+ks_result <- ks.test(resid_ols_scale, "pnorm")
+
+# 2. Independensi Temporal
+dw_result <- lmtest::dwtest(ols_model)
+
+# 3. Heteroskedastisitas
+bp_result <- lmtest::bptest(ols_model)
+
+# 4. Autokorelasi Spasial
+coords_mat <- as.matrix(variable[, c("x", "y")])
+coords_mat_jitter <- base::jitter(coords_mat, amount = 0.0001)
+nb <- spdep::knn2nb(spdep::knearneigh(coords_mat_jitter, k = 5))
+lw <- spdep::nb2listw(nb, style = "W")
+moran_test <- spdep::moran.test(resid_ols, lw)
+
+# Pembuatan Tabel Ringkasan Uji Asumsi
+tabel_asumsi_ols <- data.frame(
+  Uji_Asumsi = c("Normalitas Residual", "Independensi Temporal", "Heteroskedastisitas", "Autokorelasi Spasial"),
+  Metode     = c("Kolmogorov-Smirnov", "Durbin-Watson", "Breusch-Pagan", "Moran's I"),
+  Statistik  = round(c(ks_result$statistic, dw_result$statistic, bp_result$statistic, moran_test$estimate[1]), 4),
+  p_value    = sprintf("%.4e", c(ks_result$p.value, dw_result$p.value, bp_result$p.value, moran_test$p.value)),
+  Kesimpulan = c(
+    ifelse(ks_result$p.value > 0.05, "Normal", "Tidak Normal"),
+    ifelse(dw_result$p.value > 0.05, "Independen", "Ada Autokorelasi"),
+    ifelse(bp_result$p.value > 0.05, "Homoskedastis", "Heteroskedastis"),
+    ifelse(moran_test$p.value > 0.05, "Tidak Ada Autokorelasi", "Ada Autokorelasi")
+  )
+)
+
+cat("\n=== UJI ASUMSI RESIDUAL OLS ===\n")
+print(tabel_asumsi_ols, row.names = FALSE)
+```
+
+# Uji Multikolinearitas (Variance Inflation Vactor)
+```{r vif-test}
+cat("Uji VIF (Harus < 10):\n")
+vif_values <- car::vif(ols_model)
+vif_df <- data.frame(
+  variable = names(vif_values),
+  VIF      = round(vif_values, 4)
+)
+# Tambahkan baris konstanta
+vif_df_full <- rbind(
+  data.frame(variable = "Konstanta", VIF = NA),
+  vif_df
+)
+print(vif_df_full)
+```
+
+---
+
+# Estimasi Bandwidth dan Lamda Optimal GTWR
+```{r}
+formula_gtwr <- as.formula(paste(y, "~", paste(X, collapse = " + ")))
+
+# GRID SEARCH LAMBDA + BANDWIDTH OPTIMAL
+lambda_candidates <- c(0.01, 0.05, 0.1, 0.2, 0.5, 1.0)
+results_grid <- data.frame(lambda = numeric(), bw = numeric(), AICc = numeric())
+
+cat(sprintf("%-10s %-10s %-12s\n", "Lambda", "BW", "AICc"))
+
+for (lam in lambda_candidates) {
+  
+  # Step 1: Cari BW optimal untuk tiap lambda
+  bw_temp <- tryCatch({
+  suppressWarnings(
+    GWmodel::bw.gtwr(
+      formula  = formula_gtwr,
+      data     = sp_data,
+      obs.tv   = variable$week,
+      approach = "AICc",
+      kernel   = "gaussian",
+      adaptive = TRUE,
+      p        = 2,
+      theta    = 0,
+      longlat  = FALSE,
+      lamda    = lam
+    )
+  )
+  }, error = function(e) NA)
+  
+  if (is.na(bw_temp)) next
+  
+  # Step 2: Fit GTWR dengan bw + lambda tersebut → ambil AICc
+  fit_temp <- tryCatch({
+  suppressWarnings(
+    GWmodel::gtwr(
+      formula  = formula_gtwr,
+      data     = sp_data,
+      obs.tv   = variable$week,
+      st.bw    = bw_temp,
+      kernel   = "gaussian",
+      adaptive = TRUE,
+      p        = 2,
+      longlat  = FALSE,
+      lamda    = lam
+    )
+  ) 
+  }, error = function(e) NULL)
+  
+  if (is.null(fit_temp)) next
+  
+  aicc_val <- fit_temp$GTW.diagnostic$AICc
+  results_grid <- rbind(results_grid, 
+                        data.frame(lambda = lam, bw = bw_temp, AICc = aicc_val))
+  
+  cat(sprintf("%-10.3f %-10.0f %-12.4f\n", lam, bw_temp, aicc_val))
+}
+
+
+# PILIH KOMBINASI TERBAIK (AICc terkecil)
+best_idx    <- which.min(results_grid$AICc)
+best_lambda <- results_grid$lambda[best_idx]
+best_bw     <- results_grid$bw[best_idx]
+best_aicc   <- results_grid$AICc[best_idx]
+
+cat(sprintf("Lambda Optimal : %.3f\n", best_lambda))
+cat(sprintf("Bandwidth Optimal : %.0f\n", best_bw))
+cat(sprintf("AICc Terbaik  : %.4f\n", best_aicc))
+
+# SIMPAN UNTUK DIPAKAI DI MODEL
+bw_val  <- best_bw
+lam_val <- best_lambda
+```
+
+# Fit GTWR Model
+```{r gtwr-fit}
+gtwr_results <- suppressWarnings(
+  GWmodel::gtwr(
+    formula  = formula_gtwr,
+    data     = sp_data,
+    obs.tv   = variable$week,
+    st.bw    = bw_val,
+    kernel   = "gaussian",
+    adaptive = TRUE,
+    p        = 2,
+    longlat  = FALSE,
+    lamda    = lam_val
+  )
+)
+
+print(gtwr_results)
+```
+
+# Ekstraksi Koefisien dan Signifikansi Model
+```{r gtwr-extract}
+# Ekstraksi koefisien lokal (betas)
+coef <- as.data.frame(gtwr_results$SDF@data)
+
+# Ambil kolom koefisien (nama kolom GWmodel: variable + "_TV" untuk t-value)
+final_gtwr <- variable %>%
+  mutate(
+    Coef_NO2     = coef[["no2"]],
+    Coef_tp      = coef[["tp"]],
+    Coef_h       = coef[["h"]],
+    Coef_temp    = coef[["temp"]],
+    Coef_pop_dens = coef[["pop_dens"]],
+    t_val_NO2    = coef[["no2_TV"]],
+    Predicted    = gtwr_results$SDF$yhat,
+    Residual     = gtwr_results$SDF$residual
+  ) %>%
+  mutate(
+    Sig_NO2 = case_when(
+      t_val_NO2 >  1.96 ~ "Signifikan Positif",
+      t_val_NO2 < -1.96 ~ "Signifikan Negatif",
+      TRUE              ~ "Tidak Signifikan"
+    )
+  )
+
+cat("R-Squared      :", round(gtwr_results$GTW.diagnostic$gw.R2, 4), "\n")
+cat("AICc           :", round(gtwr_results$GTW.diagnostic$AICc, 4), "\n")
+cat("Bandwidth      :", bw_val, "\n")
+cat("Tau (Lambda)   :", lam_val, "\n\n")
+
+head(final_gtwr[, c("district", "week", "Coef_NO2", "t_val_NO2", "Sig_NO2")])
+```
+
+# Komparasi GTWR vs OLS
+```{r}
+# Pastikan objek 'gtwr_results', 'bw_val', dan 'lam_val' sudah didefinisikan dari proses Grid Search
+
+cat("\n=== PARAMETER PEMBENTUKAN MODEL GTWR ===\n")
+gtwr_param_df <- data.frame(
+  Parameter = c("Fungsi Kernel", "Bandwidth", "Lambda", "Total Observasi", "R-squared", "AICc"),
+  Nilai     = c(
+    "Gaussian (Adaptive)", 
+    as.character(bw_val), 
+    as.character(lam_val), 
+    as.character(nrow(variable)), 
+    as.character(round(gtwr_results$GTW.diagnostic$gw.R2, 4)), 
+    as.character(round(gtwr_results$GTW.diagnostic$AICc, 4))
+  )
+)
+print(gtwr_param_df, row.names = FALSE)
+
+
+cat("\n=== PERBANDINGAN DIAGNOSTIK OLS VS GTWR ===\n")
+# Perhitungan Root Mean Square Error (RMSE)
+rmse_ols  <- sqrt(mean(resid_ols^2))
+rmse_gtwr <- sqrt(mean(gtwr_results$SDF$residual^2))
+
+# Perhitungan manual AICc OLS
+k_ols    <- length(coef(ols_model))
+n_obs    <- nrow(variable)
+aicc_ols <- AIC(ols_model) + (2 * k_ols^2 + 2 * k_ols) / (n_obs - k_ols - 1)
+
+# Pembuatan Tabel Komparasi
+komparasi_df <- data.frame(
+  Model = c("OLS", "GTWR"),
+  AICc  = round(c(aicc_ols, gtwr_results$GTW.diagnostic$AICc), 4),
+  R_squared = round(c(ols_summary$r.squared, gtwr_results$GTW.diagnostic$gw.R2), 4),
+  Adj_R_squared = round(c(ols_summary$adj.r.squared, gtwr_results$GTW.diagnostic$gwR2.adj), 4),
+  RMSE  = round(c(rmse_ols, rmse_gtwr), 4)
+)
+
+print(komparasi_df, row.names = FALSE)
+```
+
+# Uji Asumsi Residual GTWR (IIDN)
+```{r gtwr-residual-tests}
+resid <- final_gtwr$Residual
+
+# Eksekusi 4 Uji Asumsi Residual GTWR
+# 1. Normalitas
+resid_standart <- scale(resid)[, 1]
+ks_gtwr <- ks.test(resid_standart, "pnorm")
+
+# 2. Independensi Temporal
+dw_gtwr <- lmtest::dwtest(lm(resid ~ 1))
+
+# 3. Heteroskedastisitas
+# Uji Breusch-Pagan terhadap variabel independen dari model OLS
+bp_gtwr <- lmtest::bptest(lm(resid ~ . , data = as.data.frame(model.matrix(ols_model)[, -1])))
+
+# 4. Autokorelasi Spasial
+# Menghitung ulang bobot spasial untuk memastikan konsistensi
+coords_mat <- as.matrix(variable[, c("x", "y")])
+coords_mat_jitter <- base::jitter(coords_mat, amount = 0.0001)
+nb <- spdep::knn2nb(spdep::knearneigh(coords_mat_jitter, k = 5))
+lw <- spdep::nb2listw(nb, style = "W")
+moran_gtwr <- spdep::moran.test(resid, lw)
+
+# Pembuatan Tabel Ringkasan Uji Asumsi GTWR
+tabel_asumsi_gtwr <- data.frame(
+  Uji_Asumsi = c("Normalitas Residual", "Independensi Temporal", "Heteroskedastisitas", "Autokorelasi Spasial"),
+  Metode     = c("Kolmogorov-Smirnov", "Durbin-Watson", "Breusch-Pagan", "Moran's I"),
+  Statistik  = round(c(ks_gtwr$statistic, dw_gtwr$statistic, bp_gtwr$statistic, moran_gtwr$estimate[1]), 4),
+  p_value    = sprintf("%.4e", c(ks_gtwr$p.value, dw_gtwr$p.value, bp_gtwr$p.value, moran_gtwr$p.value)),
+  Kesimpulan = c(
+    ifelse(ks_gtwr$p.value > 0.05, "Normal", "Tidak Normal"),
+    ifelse(dw_gtwr$p.value > 0.05, "Independen", "Ada Autokorelasi"),
+    ifelse(bp_gtwr$p.value > 0.05, "Homoskedastis", "Heteroskedastis"),
+    ifelse(moran_gtwr$p.value > 0.05, "Tidak Ada Autokorelasi", "Ada Autokorelasi")
+  )
+)
+
+cat("\n=== UJI ASUMSI RESIDUAL GTWR (IIDN) ===\n")
+print(tabel_asumsi_gtwr, row.names = FALSE)
+```
+
+```{r}
+# tabel_asumsi_ols  → dari chunk ols-assumption-tests
+# tabel_asumsi_gtwr → dari chunk gtwr-residual-tests
+
+# Gabungkan dua tabel secara berdampingan dengan kolom Model sebagai pembeda
+tabel_ols_fmt <- tabel_asumsi_ols %>%
+  dplyr::rename(
+    Statistik_OLS  = Statistik,
+    p_value_OLS    = p_value,
+    Kesimpulan_OLS = Kesimpulan
+  )
+
+tabel_gtwr_fmt <- tabel_asumsi_gtwr %>%
+  dplyr::select(Statistik, p_value, Kesimpulan) %>%
+  dplyr::rename(
+    Statistik_GTWR  = Statistik,
+    p_value_GTWR    = p_value,
+    Kesimpulan_GTWR = Kesimpulan
+  )
+
+tabel_gabungan <- cbind(tabel_ols_fmt, tabel_gtwr_fmt)
+
+cat("\n=== PERBANDINGAN UJI ASUMSI RESIDUAL: OLS vs GTWR ===\n\n")
+cat(sprintf("%-22s %-20s | %-12s %-14s %-22s | %-12s %-14s %-22s\n",
+            "Uji Asumsi", "Metode",
+            "Stat OLS", "p-val OLS", "Kesimpulan OLS",
+            "Stat GTWR", "p-val GTWR", "Kesimpulan GTWR"))
+cat("==============================================================\n")
+
+for (i in seq_len(nrow(tabel_gabungan))) {
+  cat(sprintf("%-22s %-20s | %-12s %-14s %-22s | %-12s %-14s %-22s\n",
+    tabel_gabungan$Uji_Asumsi[i],
+    tabel_gabungan$Metode[i],
+    tabel_gabungan$Statistik_OLS[i],
+    tabel_gabungan$p_value_OLS[i],
+    tabel_gabungan$Kesimpulan_OLS[i],
+    tabel_gabungan$Statistik_GTWR[i],
+    tabel_gabungan$p_value_GTWR[i],
+    tabel_gabungan$Kesimpulan_GTWR[i]
+  ))
+}
+```
+
+
+# Ekspor Hasil GTWR ke Excel
+```{r}
+# Ekspor Hasil GTWR ke Excel dengan Pilih Folder
+library(rstudioapi)
+
+# Dialog pilih folder penyimpanan
+folder_path <- rstudioapi::selectDirectory(
+  caption = "Pilih Folder Penyimpanan Excel",
+  label   = "Simpan di sini"
+)
+
+if (!is.null(folder_path)) {
+  
+  export_gtwr <- final_gtwr %>%
+    select(
+      Kecamatan     = district,
+      Minggu        = week,
+      `Koef NO2`    = Coef_NO2,
+      `T-value NO2` = t_val_NO2,
+      `Y Observasi` = ari_prevalence,
+      `Y Prediksi`  = Predicted,
+      Residual      = Residual,
+      Signifikan    = Sig_NO2
+    ) %>%
+    mutate(
+      Arah = ifelse(`Koef NO2` >= 0, "Positif", "Negatif")
+    )
+
+  file_path <- file.path(folder_path, "GTWR_Results_Full.xlsx")
+  write.xlsx(export_gtwr, file_path, rowNames = FALSE)
+  cat("File berhasil disimpan di:\n", file_path, "\n")
+
+} else {
+  cat("Penyimpanan dibatalkan.\n")
+}
+```
+
+
+# Signifikansi per Kecamatan
+```{r}
+# TABEL SIGNIFIKANSI POSITIF PER KECAMATAN
+tabel_sig_kecamatan <- final_gtwr %>%
+  group_by(district) %>%
+  summarise(
+    Mean_Koef      = round(mean(Coef_NO2, na.rm = TRUE), 4),
+    Mean_t_val     = round(mean(t_val_NO2, na.rm = TRUE), 4),
+    Minggu_Sig_Pos = sum(t_val_NO2 > 1.96, na.rm = TRUE),
+    Pct_Sig_Pos    = round(mean(t_val_NO2 > 1.96, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Kategori = case_when(
+      Pct_Sig_Pos >= 75             ~ "Dominan Signifikan Positif",
+      Pct_Sig_Pos >= 50             ~ "Mayoritas Signifikan Positif",
+      Pct_Sig_Pos >  0              ~ "Sebagian Signifikan Positif",
+      TRUE                          ~ "Tidak Signifikan"
+    )
+  ) %>%
+  rename(
+    Kecamatan           = district,
+    `Mean Koef`         = Mean_Koef,
+    `Mean t-value` = Mean_t_val,
+    `Minggu Sig. (+)`   = Minggu_Sig_Pos,
+    `Sig. Positif (%)`  = Pct_Sig_Pos
+  ) %>%
+  arrange(desc(`Sig. Positif (%)`), desc(`Minggu Sig. (+)`))
+
+print(tabel_sig_kecamatan, n = Inf)
+```
+
+# Peta Koefisien Lokal
+````{r peta-koefisien-lokal, fig.width=9, fig.height=7}
+# ── Load dan join shapefile ──────────────────────────────────────────────────
+shp_path     <- "C:/Users/zaviezra/Documents/UNDIP/TA/02skripsi/02processing/Data/DISTRICT/district_semarang.shp"
+map_semarang <- sf::st_read(shp_path, quiet = TRUE)
+
+# Transformasi ke UTM Zone 49S (EPSG:32749) agar grid koordinat tampil dalam meter
+map_semarang_utm <- sf::st_transform(map_semarang, crs = 32749)
+
+# Join dengan tabel koefisien
+map_data <- map_semarang_utm %>%
+  dplyr::left_join(tabel_sig_kecamatan, by = c("district" = "Kecamatan"))
+
+# Hitung midpoint dinamis untuk diverging scale (pusatkan di 0)
+koef_vals  <- map_data$`Mean Koef`
+koef_limit <- max(abs(koef_vals), na.rm = TRUE)
+
+# Peta koefisien: skema diverging biru–putih–merah (mengacu Guo et al. 2021 Fig. 8)
+# Biru  = pengaruh negatif NO2, Merah = pengaruh positif NO2
+ggplot(data = map_data) +
+  geom_sf(aes(fill = `Mean Koef`), color = "black", linewidth = 0.3) +
+  scale_fill_gradient2(
+    low      = "#2166ac",   # biru tua  → koefisien negatif
+    mid      = "#f7f7f7",   # putih     → koefisien ~0
+    high     = "#b2182b",   # merah tua → koefisien positif tinggi
+    midpoint = 0,
+    limits   = c(-koef_limit, koef_limit),
+    name     = "Mean\nKoefisien\nLokal NO₂",
+    guide    = guide_colorbar(barwidth = 1, barheight = 8)
+  ) +
+  geom_sf_text(
+    aes(label = district),
+    size          = 2.2,
+    family        = "serif",
+    check_overlap = TRUE,
+    color         = "gray20"
+  ) +
+  # Grid UTM + label koordinat
+  coord_sf(
+    crs   = sf::st_crs(32749),
+    datum = sf::st_crs(32749)
+  ) +
+  scale_x_continuous(
+    labels = function(x) paste0(format(x, big.mark = ".", decimal.mark = ","))
+  ) +
+  scale_y_continuous(
+    labels = function(y) paste0(format(y, big.mark = ".", decimal.mark = ","))
+  ) +
+  ggspatial::annotation_north_arrow(
+    location    = "bl",
+    which_north = "true",
+    style       = ggspatial::north_arrow_minimal(),
+    height      = unit(0.8, "cm"),
+    width       = unit(0.8, "cm")
+  ) +
+  ggspatial::annotation_scale(
+    location   = "br",
+    width_hint = 0.35,
+    text_family = "serif"
+  ) +
+  labs(
+    title    = "Peta Koefisien Lokal NO₂ terhadap Prevalensi ISPA",
+    subtitle = "Kota Semarang, Januari–Juni 2025",
+    x        = "Easting (m)",
+    y        = "Northing (m)"
+  ) +
+  theme_classic() +
+  theme(
+    text              = element_text(family = "serif"),
+    plot.title        = element_text(hjust = 0.5, face = "bold", size = 13),
+    plot.subtitle     = element_text(hjust = 0.5, size = 9, color = "gray40"),
+    axis.text         = element_text(size = 7),
+    axis.title        = element_text(size = 9),
+    axis.ticks        = element_line(color = "gray60"),
+    panel.border      = element_rect(color = "gray60", fill = NA),
+    panel.grid.major  = element_line(color = "gray85", linetype = "dashed", linewidth = 0.3),
+    legend.title      = element_text(size = 9, face = "bold"),
+    legend.text       = element_text(size = 8),
+    legend.position   = "right"
+  )
+````
+
+
+# Peta Signifikansi NO₂ (kategoris merah, UTM grid)
+```{r peta-signifikansi-no2, fig.width=9, fig.height=7}
+# Pastikan urutan kategori konsisten di legenda
+map_data$Kategori <- factor(map_data$Kategori, levels = c(
+  "Dominan Signifikan Positif",
+  "Mayoritas Signifikan Positif",
+  "Sebagian Signifikan Positif",
+  "Tidak Signifikan"
+))
+
+# Peta signifikansi: skema merah-oranye-kuning mengacu thesis (Gambar IV-23b)
+# dan Guo et al. 2021 (Fig. 8) dengan 4 kelas kategoris
+ggplot(data = map_data) +
+  geom_sf(aes(fill = Kategori), color = "black", linewidth = 0.3) +
+  scale_fill_manual(
+    values = c(
+      "Dominan Signifikan Positif"    = "#bd0026",  # merah tua   ≥75% minggu sig
+      "Sebagian Signifikan Positif"   = "#feb24c"  # oranye-kuning >0%
+    ),
+    name     = "Kategori\nSignifikansi",
+    drop     = FALSE,
+    na.value = "gray85"
+  ) +
+  geom_sf_text(
+    aes(label = district),
+    size          = 2.2,
+    family        = "serif",
+    check_overlap = TRUE,
+    color         = "gray20"
+  ) +
+  # Grid UTM + label koordinat
+  coord_sf(
+    crs   = sf::st_crs(32749),
+    datum = sf::st_crs(32749)
+  ) +
+  scale_x_continuous(
+    labels = function(x) paste0(format(x, big.mark = ".", decimal.mark = ","))
+  ) +
+  scale_y_continuous(
+    labels = function(y) paste0(format(y, big.mark = ".", decimal.mark = ","))
+  ) +
+  ggspatial::annotation_north_arrow(
+    location    = "bl",
+    which_north = "true",
+    style       = ggspatial::north_arrow_minimal(),
+    height      = unit(0.8, "cm"),
+    width       = unit(0.8, "cm")
+  ) +
+  ggspatial::annotation_scale(
+    location    = "br",
+    width_hint  = 0.35,
+    text_family = "serif"
+  ) +
+  labs(
+    title    = "Peta Signifikansi Pengaruh NO₂ terhadap Prevalensi ISPA",
+    subtitle = "Berdasarkan Persentase Minggu Signifikan per Kecamatan (α = 0,05)",
+    x        = "Easting (m)",
+    y        = "Northing (m)"
+  ) +
+  theme_classic() +
+  theme(
+    text              = element_text(family = "serif"),
+    plot.title        = element_text(hjust = 0.5, face = "bold", size = 13),
+    plot.subtitle     = element_text(hjust = 0.5, size = 9, color = "gray40"),
+    axis.text         = element_text(size = 7),
+    axis.title        = element_text(size = 9),
+    axis.ticks        = element_line(color = "gray60"),
+    panel.border      = element_rect(color = "gray60", fill = NA),
+    panel.grid.major  = element_line(color = "gray85", linetype = "dashed", linewidth = 0.3),
+    legend.title      = element_text(size = 9, face = "bold"),
+    legend.text       = element_text(size = 8),
+    legend.position   = "right"
+  )
+```
+
